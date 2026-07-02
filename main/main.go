@@ -15,7 +15,6 @@ import (
 	"go/token"
 	"go/types"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -293,10 +292,13 @@ func processAndStreamPackages(repoDir string, packages []Package, nodesWriter, i
 	importPathToInfo := make(map[string]*pkginfo)
 	fileContents := make(map[string][]byte)
 
-	// Parse all files upfront
+	// Parse all files upfront (skip stdlib — use compiled export data for those)
 	log.Println("parsing")
 	for i := range packages {
 		pkg := &packages[i]
+		if pkg.Standard {
+			continue
+		}
 		pi := pkginfo{pkg: pkg}
 		for _, grp := range []struct {
 			target string
@@ -319,7 +321,7 @@ func processAndStreamPackages(repoDir string, packages []Package, nodesWriter, i
 					continue
 				}
 
-				src, err := ioutil.ReadFile(fullPath)
+				src, err := os.ReadFile(fullPath)
 				if err != nil {
 					log.Printf("Failed to read file %s: %v", fullPath, err)
 					continue
@@ -365,7 +367,7 @@ func processAndStreamPackages(repoDir string, packages []Package, nodesWriter, i
 				}
 				return pkg, err
 			}
-			// stdlib fallback via compiled export data
+			// stdlib or unknown package — use compiled export data
 			return gcImp.Import(path)
 		}),
 		Error: func(err error) {
