@@ -19,6 +19,10 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
+	"runtime"
+	"runtime/pprof"
+	"syscall"
 	"path/filepath"
 	"strings"
 	"unicode"
@@ -104,8 +108,10 @@ type ModuleInfo struct {
 // var chrootDir = flag.String("chroot", "", "chroot before scanning")
 // var setGid = flag.Int("setgid", 0, "set group ID before scanning")
 // var setUid = flag.Int("setuid", 0, "set user ID before scanning")
-// var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+var memprofile = flag.String("memprofile", "", "write memory profile to file")
 var system = flag.Bool("system", false, "include non-local dependencies")
+var maxFileSize = flag.Int("maxfilesize", 500000, "skip source files larger than this (bytes)")
 
 func main() {
 	flag.Parse()
@@ -115,37 +121,47 @@ func main() {
 		fmt.Println("Usage: program <input_repository> <output_dir>")
 		os.Exit(1)
 	}
-	/*
-		if *cpuprofile != "" {
-			f, err := os.Create(*cpuprofile)
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+
+	if *memprofile != "" {
+		defer func() {
+			f, err := os.Create(*memprofile)
 			if err != nil {
 				log.Fatal(err)
 			}
-			pprof.StartCPUProfile(f)
-			defer pprof.StopCPUProfile()
-		}
+			runtime.GC()
+			pprof.WriteHeapProfile(f)
+			f.Close()
+		}()
+	}
 
-		if *chrootDir != "" {
-			err := unix.Chroot(*chrootDir)
+	// Handle signals so profiles are flushed on interrupt/timeout
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		log.Println("Signal received, flushing profiles...")
+		pprof.StopCPUProfile()
+		if *memprofile != "" {
+			f, err := os.Create(*memprofile)
 			if err != nil {
-				fmt.Printf("failed to chroot: %v\n", err)
-				os.Exit(1)
+				log.Fatal(err)
 			}
+			runtime.GC()
+			pprof.WriteHeapProfile(f)
+			f.Close()
 		}
-		if *setGid != 0 {
-			err := unix.Setgid(*setGid)
-			if err != nil {
-				fmt.Printf("failed to setgid: %v\n", err)
-				os.Exit(1)
-			}
-		}
-		if *setUid != 0 {
-			err := unix.Setuid(*setUid)
-			if err != nil {
-				fmt.Printf("failed to setuid: %v\n", err)
-				os.Exit(1)
-			}
-		}*/
+		os.Exit(0)
+	}()
+
 	repoDir, err := filepath.Abs(args[0])
 	if err != nil {
 		log.Fatal("failed to resolve repo path:", err)
@@ -264,42 +280,44 @@ func findPackages(repoDir string) ([]Package, error) {
 }
 
 func processAndStreamPackages(repoDir string, packages []Package, nodesWriter, indexWriter io.Writer) error {
-	// Create a single FileSet for all files
 	os.Chdir(repoDir)
 	fset := token.NewFileSet()
 
-	// Group files by package path for type checking
 	type pkginfo struct {
-		files      []*ast.File
-		test_files []*ast.File
+		srcFiles   []*ast.File // GoFiles + CgoFiles (used for imports)
+		testFiles  []*ast.File // TestGoFiles (in-package tests)
+		xtestFiles []*ast.File // XTestGoFiles (external test package)
 		pkg        *Package
 	}
 	packageInfos := make(map[string]pkginfo)
+	importPathToInfo := make(map[string]*pkginfo)
 	fileContents := make(map[string][]byte)
 
-	// Parse all files in the module first
+	// Parse all files upfront
 	log.Println("parsing")
-	for _, pkg := range packages {
-		allFiles := make([]string, 0)
-		allFiles = append(allFiles, pkg.GoFiles...)
-		allFiles = append(allFiles, pkg.CgoFiles...)
-		allFiles = append(allFiles, pkg.TestGoFiles...)
-		allTestFiles := make([]string, 0)
-		allTestFiles = append(allTestFiles, pkg.XTestGoFiles...)
-		pi := pkginfo{
-			pkg:        &pkg,
-			files:      make([]*ast.File, 0, len(allFiles)),
-			test_files: make([]*ast.File, 0, len(allTestFiles)),
-		}
+	for i := range packages {
+		pkg := &packages[i]
+		pi := pkginfo{pkg: pkg}
 		for _, grp := range []struct {
-			isTest bool
+			target string
 			files  []string
 		}{
-			{isTest: false, files: allFiles},
-			{isTest: true, files: allTestFiles},
+			{"src", append(append([]string{}, pkg.GoFiles...), pkg.CgoFiles...)},
+			{"test", pkg.TestGoFiles},
+			{"xtest", pkg.XTestGoFiles},
 		} {
 			for _, goFile := range grp.files {
 				fullPath := filepath.Join(pkg.Dir, goFile)
+
+				fi, err := os.Stat(fullPath)
+				if err != nil {
+					log.Printf("Failed to stat file %s: %v", fullPath, err)
+					continue
+				}
+				if fi.Size() > int64(*maxFileSize) {
+					log.Printf("Skipping large file (%d bytes): %s", fi.Size(), fullPath)
+					continue
+				}
 
 				src, err := ioutil.ReadFile(fullPath)
 				if err != nil {
@@ -313,36 +331,57 @@ func processAndStreamPackages(repoDir string, packages []Package, nodesWriter, i
 					continue
 				}
 
-				if grp.isTest {
-					pi.test_files = append(pi.test_files, f)
-				} else {
-					pi.files = append(pi.files, f)
+				switch grp.target {
+				case "src":
+					pi.srcFiles = append(pi.srcFiles, f)
+				case "test":
+					pi.testFiles = append(pi.testFiles, f)
+				case "xtest":
+					pi.xtestFiles = append(pi.xtestFiles, f)
 				}
 
 				fileContents[fullPath] = src
 			}
 		}
 		packageInfos[pkg.Dir] = pi
+		stored := packageInfos[pkg.Dir]
+		importPathToInfo[pkg.ImportPath] = &stored
 	}
 
-	conf := types.Config{
-		Importer: importer.ForCompiler(fset, "source", nil),
+	// Caching importer: reuse pre-parsed ASTs, type-check each package at most once
+	typeChecked := make(map[string]*types.Package)
+	gcImp := importer.Default()
+
+	var conf types.Config
+	conf = types.Config{
+		Importer: importerFunc(func(path string) (*types.Package, error) {
+			if pkg, ok := typeChecked[path]; ok {
+				return pkg, nil
+			}
+			if pi, ok := importPathToInfo[path]; ok {
+				pkg, err := conf.Check(path, fset, pi.srcFiles, nil)
+				if pkg != nil {
+					typeChecked[path] = pkg
+				}
+				return pkg, err
+			}
+			// stdlib fallback via compiled export data
+			return gcImp.Import(path)
+		}),
 		Error: func(err error) {
 			log.Printf("Type error: %v", err)
 		},
 	}
 
-	// Type check and process each package in the module
+	// Type check and process each package
 	pkgCtr := 0
 	for pkgDir, pi := range packageInfos {
 		pkgCtr++
 		inRepo := strings.HasPrefix(pkgDir+"/", repoDir)
 		if !inRepo && !*system {
-			log.Printf("skipping system package: %s", pkgDir)
 			continue
 		}
 		log.Printf("package [%d/%d]: %s", pkgCtr, len(packages), pkgDir)
-		os.Chdir(pkgDir)
 
 		info := &types.Info{
 			Types: make(map[ast.Expr]types.TypeAndValue),
@@ -350,13 +389,14 @@ func processAndStreamPackages(repoDir string, packages []Package, nodesWriter, i
 			Uses:  make(map[*ast.Ident]types.Object),
 		}
 
-		// regular .go files
-		_, err := conf.Check(pi.pkg.ImportPath, fset, pi.files, info)
+		// regular + in-package test files
+		allFiles := append(pi.srcFiles, pi.testFiles...)
+		_, err := conf.Check(pi.pkg.ImportPath, fset, allFiles, info)
 		if err != nil {
 			log.Printf("Type checking error in package %s: %v", pkgDir, err)
 		}
 
-		for _, f := range pi.files {
+		for _, f := range allFiles {
 			filename := fset.File(f.Pos()).Name()
 			if src, ok := fileContents[filename]; ok {
 				err := processAndStreamFile(repoDir, fset, f, info, src, nodesWriter, indexWriter)
@@ -366,18 +406,20 @@ func processAndStreamPackages(repoDir string, packages []Package, nodesWriter, i
 			}
 		}
 
-		// test files
-		_, err = conf.Check(pi.pkg.ImportPath+"_test", fset, pi.test_files, info)
-		if err != nil {
-			log.Printf("Type checking error in package %s: %v", pkgDir, err)
-		}
+		// external test files
+		if len(pi.xtestFiles) > 0 {
+			_, err = conf.Check(pi.pkg.ImportPath+"_test", fset, pi.xtestFiles, info)
+			if err != nil {
+				log.Printf("Type checking error in package %s: %v", pkgDir, err)
+			}
 
-		for _, f := range pi.test_files {
-			filename := fset.File(f.Pos()).Name()
-			if src, ok := fileContents[filename]; ok {
-				err := processAndStreamFile(repoDir, fset, f, info, src, nodesWriter, indexWriter)
-				if err != nil {
-					log.Printf("Error processing file %s: %v", filename, err)
+			for _, f := range pi.xtestFiles {
+				filename := fset.File(f.Pos()).Name()
+				if src, ok := fileContents[filename]; ok {
+					err := processAndStreamFile(repoDir, fset, f, info, src, nodesWriter, indexWriter)
+					if err != nil {
+						log.Printf("Error processing file %s: %v", filename, err)
+					}
 				}
 			}
 		}
