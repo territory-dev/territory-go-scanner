@@ -3,7 +3,7 @@ package main
 import (
 	"strings"
 
-	pb "github.com/pawelstiasny/territory/indexers/go/pb"
+	pb "github.com/territory-dev/territory-go-scanner/pb"
 )
 
 type TokenWriter struct {

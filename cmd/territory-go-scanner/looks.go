@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/golang/protobuf/proto"
-	pb "github.com/pawelstiasny/territory/indexers/go/pb"
+	pb "github.com/territory-dev/territory-go-scanner/pb"
 )
 
 func appendFunctionToFileNode(tw *TokenWriter, node *pb.Node) {

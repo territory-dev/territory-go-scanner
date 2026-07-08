@@ -26,7 +26,7 @@ import (
 	"strings"
 	"unicode"
 
-	pb "github.com/pawelstiasny/territory/indexers/go/pb"
+	pb "github.com/territory-dev/territory-go-scanner/pb"
 	"google.golang.org/protobuf/encoding/protodelim"
 	"google.golang.org/protobuf/proto"
 )
