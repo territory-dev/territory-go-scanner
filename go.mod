@@ -1,4 +1,4 @@
-module github.com/pawelstiasny/territory/indexers/go
+module github.com/territory-dev/territory-go-scanner
 
 go 1.26.4
 
